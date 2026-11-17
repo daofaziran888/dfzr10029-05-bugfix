@@ -1,4 +1,8 @@
-"""维度管理接口：维护分析维度，覆盖提交定义、发布维度、停用维度等动作。"""
+"""维度管理接口：维护分析维度，覆盖提交定义、发布维度、停用维度等动作。
+
+维度层级合并子资源（来源明细 / 批次合并结果 / 单一维度层级索引）也挂在这里，
+全部声明在 /{entry_id} 之前，避免被详情路由截获。
+"""
 from __future__ import annotations
 
 import csv
@@ -6,16 +10,103 @@ import io
 
 from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
+from pydantic import BaseModel, Field
 
 from app.schemas import ActionPayload, ActionResult, EntryPayload, PageResult
 from app.services.dimension import DimensionService
+from app.services.dimension_hierarchy import STRATEGIES, DimensionHierarchyService
 
 router = APIRouter(prefix="/api/dimension", tags=["维度管理"])
 
 service = DimensionService()
+hierarchy_service = DimensionHierarchyService()
 
 LIST_FIELDS = ["维度编号", "维度名称", "维度类型", "关联数据集", "层级结构", "默认取值", "排序规则", "维度状态"]
 STATUSES = ["草稿", "已定义", "已发布", "已停用"]
+IMPORT_FILTER_FIELDS = ["导入批次", "维度编号", "成员编码", "来源部门", "status"]
+
+
+class MergePayload(BaseModel):
+    """批量选择多条导入记录生成维度批次合并结果的请求体。"""
+
+    import_ids: list[int] = Field(default_factory=list)
+    strategy: str = STRATEGIES[0]
+
+
+class ImportBatchPayload(BaseModel):
+    """部门维度批量导入：一次可提交多条来源明细。"""
+
+    records: list[dict[str, object]] = Field(default_factory=list)
+
+
+# ---------------------------------------------------------------- 维度层级合并
+@router.get("/imports")
+def list_imports(
+    request: Request,
+    page: int = Query(default=1, ge=1),
+    size: int = Query(default=200, ge=1, le=1000),
+) -> dict:
+    """部门维度批量导入记录（来源明细）：合并加工的输入。"""
+    filters = {
+        key: value.strip()
+        for key, value in request.query_params.items()
+        if key in IMPORT_FILTER_FIELDS and value.strip()
+    }
+    items, total = hierarchy_service.list_imports(filters=filters, page=page, size=size)
+    return {"items": items, "total": total, "page": page, "size": size}
+
+
+@router.post("/imports", response_model=ActionResult)
+def create_imports(payload: ImportBatchPayload) -> ActionResult:
+    """部门批量导入成员归属：逐条校验落库，逐条返回成功失败。"""
+    if not payload.records:
+        return ActionResult(ok=False, message="导入内容为空，请至少提交一条来源明细")
+    result = hierarchy_service.create_imports(payload.records)
+    return ActionResult(ok=bool(result["ok"]), message=str(result["message"]), entry=result)
+
+
+@router.post("/merges", response_model=ActionResult)
+def create_merge(payload: MergePayload) -> ActionResult:
+    """编排维度批次合并结果：读既有数据后按父子路径合并重复维度成员，重建单一维度层级索引。"""
+    merge, message, per_record = hierarchy_service.create_merge(
+        import_ids=payload.import_ids, strategy=payload.strategy.strip())
+    if merge is None:
+        return ActionResult(ok=False, message=message, entry={"逐条结果": per_record})
+    return ActionResult(ok=True, message=message, entry=merge)
+
+
+@router.get("/merges")
+def list_merges(
+    page: int = Query(default=1, ge=1),
+    size: int = Query(default=200, ge=1, le=1000),
+) -> dict:
+    """维度批次合并结果列表：与详情读同一份存储，避免错位。"""
+    items, total = hierarchy_service.list_merges(page=page, size=size)
+    return {"items": items, "total": total, "page": page, "size": size}
+
+
+@router.get("/merges/{merge_id}")
+def get_merge(merge_id: int) -> dict:
+    """维度批次合并结果详情：保留来源输入与成员父路径合并过程。"""
+    merge = hierarchy_service.get_merge(merge_id)
+    if merge is None:
+        raise HTTPException(status_code=404, detail=f"维度批次合并结果 {merge_id} 不存在或已归档")
+    return merge
+
+
+@router.get("/hierarchy")
+def current_hierarchy(dimension_code: str | None = Query(default=None)) -> dict:
+    """交付数据：单一维度层级索引，同一成员只保留一条有效父路径。"""
+    return hierarchy_service.current_hierarchy(dimension_code=dimension_code)
+
+
+@router.get("/hierarchy/summary")
+def hierarchy_summary(dimension_code: str | None = Query(default=None)) -> dict:
+    """下游汇总核对：按成员计数不重复，作为消费结果的验证口径。"""
+    return hierarchy_service.hierarchy_summary(dimension_code=dimension_code)
+
+
+# ---------------------------------------------------------------- 维度管理 CRUD
 
 
 def query_filters(request: Request) -> dict[str, str]:
